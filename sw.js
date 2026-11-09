@@ -1,6 +1,6 @@
 // Offline cache so the app works without reception (e.g. in the gym).
 // Bump VERSION whenever files change.
-const VERSION = 'stopper-v5';
+const VERSION = 'stopper-v6';
 const CORE = ['./', 'index.html', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'voice/pack.json', 'voice/pack.bin'];
 
 self.addEventListener('install', e => {
