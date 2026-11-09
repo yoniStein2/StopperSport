@@ -38,7 +38,7 @@
     font-size: min(20vw, 34vh, 130px); letter-spacing: -0.02em; line-height: 1; white-space: nowrap;
   }
   #countdown { font-weight: 200; font-variant-numeric: tabular-nums; font-size: min(60vw, 50vh); line-height: 1; }
-  #hint { color: var(--dim); font-size: 17px; min-height: 1.3em; text-align: center; }
+  #hint { color: var(--dim); font-size: 17px; min-height: 1.3em; text-align: center; justify-content: center; }
 
   /* iOS-style round buttons (fill, black gap, outer ring) */
   .btn {
@@ -53,12 +53,13 @@
   .btn.red  { --c: var(--red); --b: var(--red-bg); }
   .btn.gray { --c: #fff; --b: var(--gray-bg); }
 
-  /* Big Start button: soft bordeaux with depth */
+  /* Big Start button: soft bordeaux with depth, SF Pro Rounded (Apple Fitness style) */
   #startBtn {
     --size: min(70vw, 42vh, 300px);
     width: var(--size); height: var(--size); border-radius: 50%; border: 0; cursor: pointer;
-    font-family: -apple-system, "SF Pro Display", "Helvetica Neue", sans-serif;
-    font-size: calc(var(--size) * 0.17); font-weight: 300; letter-spacing: 0.02em; color: var(--wine-text);
+    align-items: center; justify-content: center;
+    font-family: ui-rounded, "SF Pro Rounded", -apple-system, "SF Pro Display", system-ui, sans-serif;
+    font-size: calc(var(--size) * 0.18); font-weight: 600; letter-spacing: 0.01em; color: var(--wine-text);
     background:
       radial-gradient(circle at 50% 22%, rgba(255,255,255,.16), rgba(255,255,255,0) 45%),
       radial-gradient(circle at 50% 40%, var(--wine-1) 0%, var(--wine-2) 58%, var(--wine-3) 100%);
@@ -73,9 +74,10 @@
     transition: transform .12s ease, filter .12s ease;
   }
   #startBtn:active { transform: scale(.965); filter: brightness(.92); }
+  #startBtn[disabled] { opacity: .5; }
 
   /* Settings (idle screen) */
-  #settings { position: absolute; bottom: 20px; left: 16px; right: 16px; display: flex; flex-direction: column; gap: 14px; align-items: center; }
+  #settings { position: absolute; bottom: 20px; left: 16px; right: 16px; flex-direction: column; gap: 14px; align-items: center; }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; max-width: 360px; color: var(--dim); font-size: 15px; }
   .seg { display: flex; background: #1c1c1e; border-radius: 9px; padding: 2px; direction: ltr; }
   .seg button {
@@ -83,10 +85,6 @@
     min-width: 50px; padding: 6px 10px; border-radius: 7px; cursor: pointer;
   }
   .seg button[aria-pressed="true"] { background: #636366; box-shadow: 0 3px 8px rgba(0,0,0,.25); }
-  .switch { width: 51px; height: 31px; border-radius: 16px; background: #39393d; position: relative; transition: background .2s; border: 0; padding: 0; flex: none; }
-  .switch::after { content: ""; position: absolute; top: 2px; right: 2px; width: 27px; height: 27px; border-radius: 50%; background: #fff; transition: transform .2s; box-shadow: 0 2px 4px rgba(0,0,0,.3); }
-  .switch[aria-checked="true"] { background: #30d158; }
-  .switch[aria-checked="true"]::after { transform: translateX(-20px); }
 
   #tapZone { position: fixed; inset: 0; z-index: 10; display: none; }
 
@@ -103,37 +101,45 @@
 <main>
   <div id="countdown" class="v v-countdown">3</div>
   <div id="display" class="v v-running v-stopped">00:00.00</div>
-  <button id="startBtn" class="v v-idle" lang="en" style="align-items:center;justify-content:center">Start</button>
+  <button id="startBtn" class="v v-idle" lang="en" disabled>Start</button>
   <button id="stopBtn" class="btn red v v-running v-countdown" lang="en" tabindex="-1">Stop</button>
   <button id="resetBtn" class="btn gray v v-stopped" lang="en">Reset</button>
-  <div id="hint" class="v v-running v-countdown v-stopped" style="justify-content:center"></div>
+  <div id="hint" class="v v-running v-countdown v-stopped"></div>
   <div id="settings" class="v v-idle">
     <div class="row"><span>הקראת זמן כל (שניות)</span><div class="seg" id="intervalSeg"></div></div>
-    <div class="row"><span>צפצוף לפני כל הקראה</span><button id="beepSwitch" class="switch" role="switch" aria-checked="true"></button></div>
   </div>
 </main>
 <div id="tapZone"></div>
 
 <script>
 /* ===================================================================
-   Speech is pre-recorded clips (voice/*.mp3, made by tools/make_voice.py)
-   played through one <audio> element as a playlist. iOS keeps an audio
-   element playing when the screen locks, so callouts continue in a pocket.
-   The texts/language live in tools/make_voice.py; these functions only
-   choose which clip ids to play.
+   Audio design (why it is on time and keeps going when the screen locks)
+   - Spoken clips are pre-recorded (voice/*.mp3, made by tools/make_voice.py)
+     and decoded to PCM once at load.
+   - Playback is one <audio> element playing a chain of WAV "segments" built
+     in JS. Each segment already contains its callout at the exact sample
+     offset, so the speech is sample-accurate inside the segment.
+   - Segments switch LEAD seconds *before* each callout (during silence), so
+     the file-switch latency never delays speech; on each switch we seek to
+     correct for that latency against the wall clock.
+   - iOS keeps an <audio> element playing when the screen locks, and its
+     'ended' events keep firing, so the chain continues in a pocket.
+   Texts/language live in tools/make_voice.py; here we only pick clip ids.
    =================================================================== */
 const INTERVALS = [5, 10, 30, 60];
 const MAX_MIN = 90;
+const RATE = 24000;          // sample rate of generated segments
+const LEAD = 0.8;            // seconds of silence before each callout inside its segment
 const UI = {
   tapToStop: 'הקש בכל מקום כדי לעצור',
   tapToCancel: 'הקש כדי לבטל',
   tapToResume: 'הקש כדי לחדש את ההקראות',
-  stopped: '',
-  sec: 'ש׳',
+  loading: 'טוען…',
   nowPlaying: 'סטופר רץ',
   lockHint: 'עצירה = הקראת הזמן',
 };
-function calloutIds(t) {            // t = seconds, multiple of the interval
+function calloutIds(t) {            // t = seconds since "מתחילים"
+  if (t === 0) return ['go'];
   const m = Math.floor(t / 60), s = t % 60;
   if (m === 0) return ['n' + s];
   if (m > MAX_MIN) return [];
@@ -151,12 +157,10 @@ const store = {
   set(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
 };
 let interval = store.get('interval', 10); if (!INTERVALS.includes(interval)) interval = 10;
-let beepOn = store.get('beep', true);
 
 /* ---------------- Elements ---------------- */
 const $ = id => document.getElementById(id);
-const body = document.body, display = $('display'), cdEl = $('countdown'), hint = $('hint');
-
+const body = document.body, display = $('display'), cdEl = $('countdown'), hint = $('hint'), startBtn = $('startBtn');
 const seg = $('intervalSeg');
 function renderSeg() {
   seg.innerHTML = '';
@@ -169,41 +173,125 @@ function renderSeg() {
   }
 }
 renderSeg();
-const beepSwitch = $('beepSwitch');
-function renderBeep() { beepSwitch.setAttribute('aria-checked', String(beepOn)); }
-renderBeep();
-beepSwitch.addEventListener('click', () => { beepOn = !beepOn; store.set('beep', beepOn); renderBeep(); });
 
-/* ---------------- Clips: preload into memory ---------------- */
-const clipUrl = {};
-fetch('voice/clips.json').then(r => r.json()).then(ids => Promise.all(ids.map(async id => {
-  try { const r = await fetch('voice/' + id + '.mp3'); if (r.ok) clipUrl[id] = URL.createObjectURL(await r.blob()); } catch (e) {}
-}))).catch(() => {});
-const urlOf = id => clipUrl[id] || ('voice/' + id + '.mp3');
+/* ---------------- Clips: load + decode to PCM ---------------- */
+const pcm = {};                     // id -> Float32Array @ RATE
+let clipsReady = false;
+(async function loadClips() {
+  try {
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const ctx = new OAC(1, 1, RATE);
+    const ids = await (await fetch('voice/clips.json')).json();
+    await Promise.all(ids.map(async id => {
+      try {
+        const buf = await (await fetch('voice/' + id + '.mp3')).arrayBuffer();
+        const ab = await new Promise((res, rej) => { const p = ctx.decodeAudioData(buf, res, rej); if (p && p.then) p.then(res, rej); });
+        pcm[id] = ab.getChannelData(0).slice();
+      } catch (e) {}
+    }));
+  } catch (e) {}
+  // beep: 1 kHz, 150 ms, soft edges
+  const n = Math.round(0.15 * RATE), b = new Float32Array(n);
+  for (let i = 0; i < n; i++) { const env = Math.min(1, i / 120, (n - i) / 600); b[i] = 0.55 * env * Math.sin(2 * Math.PI * 1000 * i / RATE); }
+  pcm.beep = b;
+  clipsReady = true;
+  if (state === 'idle') startBtn.disabled = false;
+})();
 
-/* ---------------- Audio playlist engine ---------------- */
+/* Build a WAV blob URL: `seconds` long, with clip sequences placed at given offsets. */
+let lastUrl = null;
+function buildWav(seconds, events) {           // events: [{at: sec, ids: [...]}]
+  const len = Math.max(1, Math.round(seconds * RATE));
+  const data = new Int16Array(len);
+  for (const ev of events) {
+    let pos = Math.round(ev.at * RATE);
+    for (const id of ev.ids) {
+      const c = pcm[id]; if (!c) continue;
+      for (let i = 0; i < c.length && pos + i < len; i++) {
+        const v = Math.max(-1, Math.min(1, c[i] + data[pos + i] / 32768));
+        data[pos + i] = v * 32767;
+      }
+      pos += c.length + Math.round(0.03 * RATE);
+    }
+  }
+  const h = new DataView(new ArrayBuffer(44));
+  const w = (o, s) => { for (let i = 0; i < 4; i++) h.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); h.setUint32(4, 36 + len * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  h.setUint32(16, 16, true); h.setUint16(20, 1, true); h.setUint16(22, 1, true);
+  h.setUint32(24, RATE, true); h.setUint32(28, RATE * 2, true); h.setUint16(32, 2, true); h.setUint16(34, 16, true);
+  w(36, 'data'); h.setUint32(40, len * 2, true);
+  if (lastUrl) setTimeout(URL.revokeObjectURL.bind(URL, lastUrl), 5000);
+  return (lastUrl = URL.createObjectURL(new Blob([h, data], { type: 'audio/wav' })));
+}
+
+/* ---------------- Player: chain of segments ---------------- */
 try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
 const player = new Audio();
 player.preload = 'auto';
 player.setAttribute('playsinline', '');
-let queue = [], current = null, engineOn = false, needsResume = false;
+let segStartWall = 0;     // wall-clock ms at which the current segment's t=0 should be
+let segEndWall = 0;       // wall-clock ms at which the current segment ends (= next segment's start)
+let segKind = null;       // 'countdown' | 'run' | 'final'
+let seekPending = false, needsResume = false;
 
-function playId(id) {
-  current = id;
-  player.src = urlOf(id);
+function playSeg(url, kind, startWall, endWall, seek) {
+  segKind = kind; segStartWall = startWall; segEndWall = endWall; seekPending = seek;
+  player.src = url;
   const p = player.play();
   if (p) p.catch(err => { if (err && err.name === 'NotAllowedError' && state === 'running') { needsResume = true; hint.textContent = UI.tapToResume; } });
 }
-function next() {
-  tick();
-  if (queue.length) playId(queue.shift());
-  else if (state === 'running' || state === 'countdown') playId('silence');
-  else { engineOn = false; current = null; player.pause(); clearMedia(); }
+// Correct for load latency: jump to where the wall clock says we should be (never past the callout).
+player.addEventListener('loadedmetadata', () => {
+  if (!seekPending) return;
+  seekPending = false;
+  const off = (Date.now() - segStartWall) / 1000;
+  if (off > 0.02) try { player.currentTime = Math.min(off, LEAD - 0.05); } catch (e) {}
+});
+// Fine sync once audio is really flowing (currentTime is reliable only after playback starts):
+// - countdown: move the clock to match the audio (beeps / "מתחילים" define 0:00)
+// - run: nudge the audio to match the clock, while still in the silent lead-in
+let fixes = 0;
+player.addEventListener('playing', () => { fixes = 0; });
+player.addEventListener('timeupdate', () => {
+  const ct = player.currentTime, now = Date.now();
+  if (segKind === 'countdown' && state === 'countdown' && ct > 0.15 && ct < 2.8) {
+    cdStart = now - ct * 1000;
+    runStart = cdStart + 3000;
+    segEndWall = runStart + interval * 1000 - LEAD * 1000;
+    cdSynced = true;
+  } else if (segKind === 'run' && ct > 0.1 && ct < LEAD - 0.15 && fixes < 3) {
+    const drift = (now - segStartWall) / 1000 - ct;           // >0: audio is behind the clock
+    if (Math.abs(drift) > 0.025) { fixes++; try { player.currentTime = Math.min(ct + drift, LEAD - 0.05); } catch (e) {} }
+  }
+});
+player.addEventListener('ended', onSegEnded);
+player.addEventListener('error', () => { if (state === 'running' || state === 'countdown') setTimeout(onSegEnded, 50); });
+
+/* Segment covering [startWall, endWall) of the run, with every callout inside it. */
+function runSegment(startWall, endWall) {
+  const I = interval * 1000, events = [];
+  for (let k = Math.ceil((startWall - runStart) / I); runStart + k * I < endWall; k++) {
+    if (k < 1) continue;
+    events.push({ at: (runStart + k * I - startWall) / 1000, ids: calloutIds(k * interval) });
+  }
+  return buildWav((endWall - startWall) / 1000, events);
 }
-player.addEventListener('ended', next);
-player.addEventListener('error', () => { if (engineOn) setTimeout(next, 50); });
-function startEngine(first) { engineOn = true; setMedia(); queue = []; playId(first); }
-const withBeep = (ids, b = 'beep') => (beepOn ? [b, ...ids] : ids);
+function nextBoundary(after) {      // first segment boundary (callout − LEAD) after `after`
+  const I = interval * 1000;
+  const k = Math.max(1, Math.floor((after - runStart + LEAD * 1000) / I) + 1);
+  return runStart + k * I - LEAD * 1000;
+}
+function onSegEnded() {
+  if (state === 'countdown') { beginRun(); }
+  if (state === 'running') {
+    let start = segEndWall;
+    if (Date.now() - start > LEAD * 1000) start = Date.now();       // fell far behind (e.g. was interrupted)
+    const end = nextBoundary(start + 50);
+    playSeg(runSegment(start, end), 'run', start, end, true);
+    return;
+  }
+  if (segKind === 'final' || state === 'idle') { player.pause(); clearMedia(); }
+}
 
 /* ---------------- Lock-screen controls ---------------- */
 function setMedia() {
@@ -214,19 +302,16 @@ function setMedia() {
       artwork: [{ src: 'icon-512.png', sizes: '512x512', type: 'image/png' }],
     });
     navigator.mediaSession.setActionHandler('pause', () => stop());
-    navigator.mediaSession.setActionHandler('play', () => { if (engineOn) player.play().catch(() => {}); });
-    for (const a of ['stop']) try { navigator.mediaSession.setActionHandler(a, () => stop()); } catch (e) {}
+    navigator.mediaSession.setActionHandler('play', () => { player.play().catch(() => {}); });
+    try { navigator.mediaSession.setActionHandler('stop', () => stop()); } catch (e) {}
     for (const a of ['seekbackward', 'seekforward', 'previoustrack', 'nexttrack']) try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {}
   } catch (e) {}
 }
-function clearMedia() {
-  if (!('mediaSession' in navigator)) return;
-  try { navigator.mediaSession.metadata = null; } catch (e) {}
-}
+function clearMedia() { try { if ('mediaSession' in navigator) navigator.mediaSession.metadata = null; } catch (e) {} }
 
-/* ---------------- Timer state machine (wall clock, survives sleep) ---------------- */
+/* ---------------- Timer state machine (wall clock) ---------------- */
 let state = 'idle';
-let raf = 0, cdStart = 0, cdShown = -1, runStart = 0, lastK = 0, stoppedAt = 0, lastText = '';
+let raf = 0, cdStart = 0, cdSynced = false, runStart = 0, stoppedAt = 0, lastText = '';
 function setState(s) { state = s; body.dataset.state = s; }
 
 function fmt(ms) {
@@ -236,44 +321,40 @@ function fmt(ms) {
 }
 function render(ms) { const t = fmt(ms); if (t !== lastText) { display.textContent = t; lastText = t; } }
 
-// Called from rAF (foreground) and from every clip end (also when locked).
-function tick() {
+function frame() {
   const now = Date.now();
   if (state === 'countdown') {
-    const idx = Math.floor((now - cdStart) / 1000);
-    if (idx >= 3) beginRun(cdStart + 3000);
-    else if (idx > cdShown) { cdShown = idx; cdEl.textContent = String(3 - idx); queue.push(...withBeep(['cd' + (3 - idx)])); }
+    const left = 3 - Math.floor((now - cdStart) / 1000);
+    cdEl.textContent = String(Math.max(1, Math.min(3, left)));
+    if (cdSynced && now >= runStart) beginRun();       // visual switch even if 'ended' is late
   }
-  if (state === 'running') {
-    const k = Math.floor((now - runStart) / (interval * 1000));
-    if (k > lastK) { lastK = k; queue.push(...withBeep(calloutIds(k * interval))); }
-  }
-}
-
-function frame() {
-  tick();
-  if (queue.length && current === 'silence') next();       // speak right away instead of waiting for the silence clip
-  if (state === 'running') render(Date.now() - runStart);
+  if (state === 'running') render(now - runStart);
   if (state === 'countdown' || state === 'running') raf = requestAnimationFrame(frame);
 }
 function loop() { cancelAnimationFrame(raf); raf = requestAnimationFrame(frame); }
 
 function startCountdown() {
+  if (!clipsReady) return;
   setState('countdown');
   hint.textContent = UI.tapToCancel;
-  cdStart = Date.now(); cdShown = 0; cdEl.textContent = '3';
-  startEngine(beepOn ? 'beep' : 'cd3');                     // first play() inside the tap unlocks audio on iOS
-  if (beepOn) queue.push('cd3');
+  cdEl.textContent = '3';
+  cdStart = Date.now(); cdSynced = false;
+  runStart = cdStart + 3000;
+  // beeps at 0,1,2 s → "מתחילים" at 3 s (=0:00) → silence until LEAD before the first callout
+  const end = 3 + interval - LEAD;
+  const url = buildWav(end, [{ at: 0, ids: ['beep'] }, { at: 1, ids: ['beep'] }, { at: 2, ids: ['beep'] }, { at: 3, ids: ['go'] }]);
+  setMedia();
+  playSeg(url, 'countdown', cdStart, runStart + interval * 1000 - LEAD * 1000, false);   // play() inside the tap unlocks audio
   loop();
 }
 
-function beginRun(t0) {
+function beginRun() {
+  if (state !== 'countdown') return;
   setState('running');
   hint.textContent = UI.tapToStop;
-  runStart = t0; lastK = 0; lastText = ''; needsResume = false;
+  lastText = ''; needsResume = false;
   store.set('run', { state: 'running', start: runStart, interval });
   render(Date.now() - runStart);
-  queue.push(...withBeep(['go'], 'beephi'));
 }
 
 function stop() {
@@ -284,37 +365,41 @@ function stop() {
   setState('stopped');
   stoppedAt = performance.now();
   render(elapsed);
-  hint.textContent = UI.stopped;
+  hint.textContent = '';
   store.set('run', { state: 'stopped', elapsed });
-  queue = withBeep(finalIds(Math.floor(elapsed / 1000)));
-  if (engineOn) next(); else { engineOn = true; playId(queue.shift()); }
+  const url = buildWav(4, [{ at: 0, ids: finalIds(Math.floor(elapsed / 1000)) }]);
+  playSeg(url, 'final', Date.now(), Date.now() + 4000, false);
 }
 
 function reset() {
   cancelAnimationFrame(raf);
   setState('idle');
-  queue = []; engineOn = false; current = null; player.pause(); clearMedia();
+  segKind = null; player.pause(); clearMedia();
   lastText = ''; display.textContent = '00:00.00';
+  startBtn.disabled = !clipsReady;
   store.set('run', null);
 }
 
 /* ---------------- Input ---------------- */
-$('startBtn').addEventListener('click', startCountdown);
+startBtn.addEventListener('click', startCountdown);
 $('tapZone').addEventListener('pointerdown', e => {
   if (needsResume) return;            // resume needs a full tap (click) for iOS to allow audio
   e.preventDefault();
   stop();
 });
 $('tapZone').addEventListener('click', () => {
-  if (!needsResume) return;
-  needsResume = false; hint.textContent = UI.tapToStop; startEngine('silence');
+  if (!needsResume || !clipsReady) return;
+  needsResume = false; hint.textContent = UI.tapToStop;
+  setMedia();
+  const start = Date.now(), end = nextBoundary(start + 50);
+  playSeg(runSegment(start, end), 'run', start, end, true);
 });
 $('resetBtn').addEventListener('click', () => {
   if (performance.now() - stoppedAt < 600) return;   // ignore the click left over from the stop tap
   reset();
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && engineOn && player.paused) player.play().catch(() => {});
+  if (document.visibilityState === 'visible' && (state === 'running') && player.paused && !needsResume) onSegEnded();
 });
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('gesturestart', e => e.preventDefault());
@@ -325,12 +410,12 @@ document.addEventListener('gesturestart', e => e.preventDefault());
   if (!r) return;
   if (r.state === 'running') {
     runStart = r.start;
-    lastK = Math.floor((Date.now() - runStart) / (interval * 1000));
+    if (INTERVALS.includes(r.interval)) interval = r.interval;
     setState('running');
     needsResume = true; hint.textContent = UI.tapToResume;
     loop();
   } else if (r.state === 'stopped') {
-    setState('stopped'); render(r.elapsed); hint.textContent = UI.stopped;
+    setState('stopped'); render(r.elapsed);
   }
 })();
 
