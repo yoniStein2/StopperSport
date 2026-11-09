@@ -1,14 +1,12 @@
 // Offline cache so the app works without reception (e.g. in the gym).
 // Bump VERSION whenever files change.
-const VERSION = 'stopper-v4';
-const CORE = ['./', 'index.html', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'voice/clips.json'];
+const VERSION = 'stopper-v5';
+const CORE = ['./', 'index.html', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'voice/pack.json', 'voice/pack.bin'];
 
 self.addEventListener('install', e => {
   e.waitUntil((async () => {
     const c = await caches.open(VERSION);
     await c.addAll(CORE);
-    const ids = await (await fetch('voice/clips.json', { cache: 'no-store' })).json();
-    await c.addAll(ids.map(id => 'voice/' + id + '.mp3'));
     await self.skipWaiting();
   })());
 });

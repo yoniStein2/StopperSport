@@ -113,33 +113,32 @@
 
 <script>
 /* ===================================================================
-   Audio design (why it is on time and keeps going when the screen locks)
-   - Spoken clips are pre-recorded (voice/*.mp3, made by tools/make_voice.py)
-     and decoded to PCM once at load.
-   - Playback is one <audio> element playing a chain of WAV "segments" built
-     in JS. Each segment already contains its callout at the exact sample
-     offset, so the speech is sample-accurate inside the segment.
-   - Segments switch LEAD seconds *before* each callout (during silence), so
-     the file-switch latency never delays speech; on each switch we seek to
-     correct for that latency against the wall clock.
-   - iOS keeps an <audio> element playing when the screen locks, and its
-     'ended' events keep firing, so the chain continues in a pocket.
+   Audio design
+   - voice/pack.bin holds every clip as constant-size MP3 frames
+     (144 bytes = 24 ms each, no bit reservoir), so frames splice freely.
+   - On the idle screen we pre-build ONE continuous MP3 for the whole run:
+     3 beeps, "מתחילים" at 0:00, and every callout at its exact frame.
+   - Start plays that single file. No file switches or seeks while running,
+     so callout timing is fixed by the audio clock alone and nothing heavy
+     runs on the main thread during the run.
+   - The display clock is locked to the audio position (sampled each frame,
+     earliest-estimate filter), so what you see matches what you hear.
+   - iOS keeps an <audio> element playing when the screen locks.
    Texts/language live in tools/make_voice.py; here we only pick clip ids.
    =================================================================== */
 const INTERVALS = [5, 10, 30, 60];
 const MAX_MIN = 90;
-const RATE = 24000;          // sample rate of generated segments
-const LEAD = 0.8;            // seconds of silence before each callout inside its segment
+const FR = 144, FS = 576 / 24000;   // bytes and seconds per MP3 frame
+const SHIFT = 2;                    // frames: compensates the ~47 ms MP3 encoder delay
+const FILE_SEC = 3600;              // one audio file covers an hour of callouts
 const UI = {
   tapToStop: 'הקש בכל מקום כדי לעצור',
   tapToCancel: 'הקש כדי לבטל',
   tapToResume: 'הקש כדי לחדש את ההקראות',
-  loading: 'טוען…',
   nowPlaying: 'סטופר רץ',
   lockHint: 'עצירה = הקראת הזמן',
 };
 function calloutIds(t) {            // t = seconds since "מתחילים"
-  if (t === 0) return ['go'];
   const m = Math.floor(t / 60), s = t % 60;
   if (m === 0) return ['n' + s];
   if (m > MAX_MIN) return [];
@@ -168,129 +167,109 @@ function renderSeg() {
     const b = document.createElement('button');
     b.textContent = String(v);
     b.setAttribute('aria-pressed', String(v === interval));
-    b.addEventListener('click', () => { interval = v; store.set('interval', v); renderSeg(); });
+    b.addEventListener('click', () => { if (v === interval) return; interval = v; store.set('interval', v); renderSeg(); prebuild(); });
     seg.appendChild(b);
   }
 }
 renderSeg();
 
-/* ---------------- Clips: load + decode to PCM ---------------- */
-const pcm = {};                     // id -> Float32Array @ RATE
-let clipsReady = false;
-(async function loadClips() {
-  try {
-    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
-    const ctx = new OAC(1, 1, RATE);
-    const ids = await (await fetch('voice/clips.json')).json();
-    await Promise.all(ids.map(async id => {
-      try {
-        const buf = await (await fetch('voice/' + id + '.mp3')).arrayBuffer();
-        const ab = await new Promise((res, rej) => { const p = ctx.decodeAudioData(buf, res, rej); if (p && p.then) p.then(res, rej); });
-        pcm[id] = ab.getChannelData(0).slice();
-      } catch (e) {}
-    }));
-  } catch (e) {}
-  // beep: 1 kHz, 150 ms, soft edges
-  const n = Math.round(0.15 * RATE), b = new Float32Array(n);
-  for (let i = 0; i < n; i++) { const env = Math.min(1, i / 120, (n - i) / 600); b[i] = 0.55 * env * Math.sin(2 * Math.PI * 1000 * i / RATE); }
-  pcm.beep = b;
-  clipsReady = true;
-  if (state === 'idle') startBtn.disabled = false;
-})();
+/* ---------------- Voice pack + MP3 splicing ---------------- */
+let pack = null, index = null;
+function bytesOf(id) { const e = index[id]; return e ? pack.subarray(e[0] * FR, (e[0] + e[1]) * FR) : null; }
+function framesOf(id) { const e = index[id]; return e ? e[1] : 0; }
 
-/* Build a WAV blob URL: `seconds` long, with clip sequences placed at given offsets. */
-let lastUrl = null;
-function buildWav(seconds, events) {           // events: [{at: sec, ids: [...]}]
-  const len = Math.max(1, Math.round(seconds * RATE));
-  const data = new Int16Array(len);
+// events: [{at: seconds in file, ids: [...]}] (sorted). Returns a blob URL of one continuous MP3.
+function buildMp3(totalSec, events) {
+  const sil = bytesOf('silence'), silN = framesOf('silence');
+  const parts = []; let f = 0;
+  const pad = to => { while (f < to) { const k = Math.min(to - f, silN); parts.push(k === silN ? sil : sil.subarray(0, k * FR)); f += k; } };
   for (const ev of events) {
-    let pos = Math.round(ev.at * RATE);
-    for (const id of ev.ids) {
-      const c = pcm[id]; if (!c) continue;
-      for (let i = 0; i < c.length && pos + i < len; i++) {
-        const v = Math.max(-1, Math.min(1, c[i] + data[pos + i] / 32768));
-        data[pos + i] = v * 32767;
-      }
-      pos += c.length + Math.round(0.03 * RATE);
-    }
+    pad(Math.round(ev.at / FS) - SHIFT);
+    for (const id of ev.ids) { const b = bytesOf(id); if (b) { parts.push(b); f += framesOf(id); } }
   }
-  const h = new DataView(new ArrayBuffer(44));
-  const w = (o, s) => { for (let i = 0; i < 4; i++) h.setUint8(o + i, s.charCodeAt(i)); };
-  w(0, 'RIFF'); h.setUint32(4, 36 + len * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
-  h.setUint32(16, 16, true); h.setUint16(20, 1, true); h.setUint16(22, 1, true);
-  h.setUint32(24, RATE, true); h.setUint32(28, RATE * 2, true); h.setUint16(32, 2, true); h.setUint16(34, 16, true);
-  w(36, 'data'); h.setUint32(40, len * 2, true);
-  if (lastUrl) setTimeout(URL.revokeObjectURL.bind(URL, lastUrl), 5000);
-  return (lastUrl = URL.createObjectURL(new Blob([h, data], { type: 'audio/wav' })));
+  pad(Math.round(totalSec / FS));
+  return URL.createObjectURL(new Blob(parts, { type: 'audio/mpeg' }));
+}
+// Audio-time: 0 = first beep, 3 = "מתחילים" (0:00 on the display). A file starts at audio-time `from`.
+function buildRunFile(from) {
+  const I = interval, events = [];
+  if (from === 0) events.push({ at: 0, ids: ['beep'] }, { at: 1, ids: ['beep'] }, { at: 2, ids: ['beep'] }, { at: 3, ids: ['go'] });
+  for (let k = Math.max(1, Math.ceil((from - 3) / I)); 3 + k * I < from + FILE_SEC; k++) {
+    if (3 + k * I < from) continue;
+    events.push({ at: 3 + k * I - from, ids: calloutIds(k * I) });
+  }
+  return buildMp3(FILE_SEC + (from === 0 ? 3 : 0), events);
+}
+let runUrl = null, runUrlFor = null;
+function prebuild() {
+  if (!pack) return;
+  if (runUrl) URL.revokeObjectURL(runUrl);
+  runUrl = buildRunFile(0); runUrlFor = interval;
 }
 
-/* ---------------- Player: chain of segments ---------------- */
+(async function loadPack() {
+  try {
+    const [bin, idx] = await Promise.all([
+      fetch('voice/pack.bin').then(r => r.arrayBuffer()),
+      fetch('voice/pack.json').then(r => r.json()),
+    ]);
+    pack = new Uint8Array(bin); index = idx;
+    prebuild();
+    if (state === 'idle') startBtn.disabled = false;
+  } catch (e) {}
+})();
+
+/* ---------------- Player ---------------- */
 try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
 const player = new Audio();
 player.preload = 'auto';
 player.setAttribute('playsinline', '');
-let segStartWall = 0;     // wall-clock ms at which the current segment's t=0 should be
-let segEndWall = 0;       // wall-clock ms at which the current segment ends (= next segment's start)
-let segKind = null;       // 'countdown' | 'run' | 'final'
-let seekPending = false, needsResume = false;
+let fileKind = null;        // 'run' | 'final'
+let fileFrom = 0;           // audio-time (s) at which the current run file starts
+let pendingSeek = null, needsResume = false;
 
-function playSeg(url, kind, startWall, endWall, seek) {
-  segKind = kind; segStartWall = startWall; segEndWall = endWall; seekPending = seek;
+function playFile(url, kind, from, seekTo) {
+  fileKind = kind; fileFrom = from; pendingSeek = seekTo;
   player.src = url;
   const p = player.play();
   if (p) p.catch(err => { if (err && err.name === 'NotAllowedError' && state === 'running') { needsResume = true; hint.textContent = UI.tapToResume; } });
 }
-// Correct for load latency: jump to where the wall clock says we should be (never past the callout).
 player.addEventListener('loadedmetadata', () => {
-  if (!seekPending) return;
-  seekPending = false;
-  const off = (Date.now() - segStartWall) / 1000;
-  if (off > 0.02) try { player.currentTime = Math.min(off, LEAD - 0.05); } catch (e) {}
+  if (pendingSeek != null) { try { player.currentTime = pendingSeek; } catch (e) {} pendingSeek = null; }
 });
-// Fine sync once audio is really flowing (currentTime is reliable only after playback starts):
-// - countdown: move the clock to match the audio (beeps / "מתחילים" define 0:00)
-// - run: nudge the audio to match the clock, while still in the silent lead-in
-let fixes = 0;
-player.addEventListener('playing', () => { fixes = 0; });
-player.addEventListener('timeupdate', () => {
-  const ct = player.currentTime, now = Date.now();
-  if (segKind === 'countdown' && state === 'countdown' && ct > 0.15 && ct < 2.8) {
-    cdStart = now - ct * 1000;
-    runStart = cdStart + 3000;
-    segEndWall = runStart + interval * 1000 - LEAD * 1000;
-    cdSynced = true;
-  } else if (segKind === 'run' && ct > 0.1 && ct < LEAD - 0.15 && fixes < 3) {
-    const drift = (now - segStartWall) / 1000 - ct;           // >0: audio is behind the clock
-    if (Math.abs(drift) > 0.025) { fixes++; try { player.currentTime = Math.min(ct + drift, LEAD - 0.05); } catch (e) {} }
-  }
-});
-player.addEventListener('ended', onSegEnded);
-player.addEventListener('error', () => { if (state === 'running' || state === 'countdown') setTimeout(onSegEnded, 50); });
-
-/* Segment covering [startWall, endWall) of the run, with every callout inside it. */
-function runSegment(startWall, endWall) {
-  const I = interval * 1000, events = [];
-  for (let k = Math.ceil((startWall - runStart) / I); runStart + k * I < endWall; k++) {
-    if (k < 1) continue;
-    events.push({ at: (runStart + k * I - startWall) / 1000, ids: calloutIds(k * interval) });
-  }
-  return buildWav((endWall - startWall) / 1000, events);
-}
-function nextBoundary(after) {      // first segment boundary (callout − LEAD) after `after`
-  const I = interval * 1000;
-  const k = Math.max(1, Math.floor((after - runStart + LEAD * 1000) / I) + 1);
-  return runStart + k * I - LEAD * 1000;
-}
-function onSegEnded() {
-  if (state === 'countdown') { beginRun(); }
-  if (state === 'running') {
-    let start = segEndWall;
-    if (Date.now() - start > LEAD * 1000) start = Date.now();       // fell far behind (e.g. was interrupted)
-    const end = nextBoundary(start + 50);
-    playSeg(runSegment(start, end), 'run', start, end, true);
+player.addEventListener('ended', () => {
+  if (fileKind === 'run' && state === 'running') {         // next hour
+    const from = fileFrom + FILE_SEC + (fileFrom === 0 ? 3 : 0);
+    playFile(buildRunFile(from), 'run', from, Math.max(0, audioNow() - from));
     return;
   }
-  if (segKind === 'final' || state === 'idle') { player.pause(); clearMedia(); }
+  player.pause(); clearMedia();
+});
+
+/* ---------------- Clock locked to the audio ----------------
+   audioZero = wall-clock ms at which audio-time 0 played. Estimate from
+   now − currentTime; stale currentTime readings only make the estimate later,
+   so the minimum over a window is the best one. */
+let audioZero = 0, syncSamples = 0, winMin = Infinity, winStart = 0;
+const audioNow = () => (Date.now() - audioZero) / 1000;   // seconds of audio-time
+function sampleSync(now) {
+  if (fileKind !== 'run' || player.paused || player.seeking || pendingSeek != null) return;
+  const ct = player.currentTime;
+  if (ct < 0.05) return;
+  const est = now - (fileFrom + ct) * 1000;
+  if (state === 'countdown') {                      // converge fast during the countdown
+    audioZero = syncSamples++ === 0 ? est : Math.min(audioZero, est);
+    return;
+  }
+  winMin = Math.min(winMin, est);
+  if (now - winStart > 1500) {
+    if (winMin !== Infinity) {
+      const d = winMin - audioZero;
+      if (Math.abs(d) > 400) { try { player.currentTime = (now - audioZero) / 1000 - fileFrom; } catch (e) {} }  // audio stalled: catch it up
+      else if (Math.abs(d) > 15) audioZero += d * 0.3;                                                        // tiny drift: follow the audio
+    }
+    winMin = Infinity; winStart = now;
+  }
 }
 
 /* ---------------- Lock-screen controls ---------------- */
@@ -304,15 +283,16 @@ function setMedia() {
     navigator.mediaSession.setActionHandler('pause', () => stop());
     navigator.mediaSession.setActionHandler('play', () => { player.play().catch(() => {}); });
     try { navigator.mediaSession.setActionHandler('stop', () => stop()); } catch (e) {}
-    for (const a of ['seekbackward', 'seekforward', 'previoustrack', 'nexttrack']) try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {}
+    for (const a of ['seekbackward', 'seekforward', 'previoustrack', 'nexttrack', 'seekto']) try { navigator.mediaSession.setActionHandler(a, null); } catch (e) {}
   } catch (e) {}
 }
 function clearMedia() { try { if ('mediaSession' in navigator) navigator.mediaSession.metadata = null; } catch (e) {} }
 
-/* ---------------- Timer state machine (wall clock) ---------------- */
+/* ---------------- State machine ---------------- */
 let state = 'idle';
-let raf = 0, cdStart = 0, cdSynced = false, runStart = 0, stoppedAt = 0, lastText = '';
+let raf = 0, stoppedAt = 0, lastText = '', lastCd = '';
 function setState(s) { state = s; body.dataset.state = s; }
+const runStart = () => audioZero + 3000;
 
 function fmt(ms) {
   const cs = Math.floor(Math.max(0, ms) / 10);
@@ -323,60 +303,58 @@ function render(ms) { const t = fmt(ms); if (t !== lastText) { display.textConte
 
 function frame() {
   const now = Date.now();
+  sampleSync(now);
   if (state === 'countdown') {
-    const left = 3 - Math.floor((now - cdStart) / 1000);
-    cdEl.textContent = String(Math.max(1, Math.min(3, left)));
-    if (cdSynced && now >= runStart) beginRun();       // visual switch even if 'ended' is late
+    const n = String(Math.max(1, Math.min(3, 3 - Math.floor((now - audioZero) / 1000))));
+    if (n !== lastCd) { cdEl.textContent = n; lastCd = n; }
+    if (now >= runStart()) beginRun();
   }
-  if (state === 'running') render(now - runStart);
+  if (state === 'running') render(now - runStart());
   if (state === 'countdown' || state === 'running') raf = requestAnimationFrame(frame);
 }
-function loop() { cancelAnimationFrame(raf); raf = requestAnimationFrame(frame); }
+function loop() { cancelAnimationFrame(raf); winMin = Infinity; winStart = Date.now(); raf = requestAnimationFrame(frame); }
 
 function startCountdown() {
-  if (!clipsReady) return;
+  if (!pack) return;
+  if (runUrlFor !== interval) prebuild();
   setState('countdown');
   hint.textContent = UI.tapToCancel;
-  cdEl.textContent = '3';
-  cdStart = Date.now(); cdSynced = false;
-  runStart = cdStart + 3000;
-  // beeps at 0,1,2 s → "מתחילים" at 3 s (=0:00) → silence until LEAD before the first callout
-  const end = 3 + interval - LEAD;
-  const url = buildWav(end, [{ at: 0, ids: ['beep'] }, { at: 1, ids: ['beep'] }, { at: 2, ids: ['beep'] }, { at: 3, ids: ['go'] }]);
+  cdEl.textContent = lastCd = '3';
+  audioZero = Date.now(); syncSamples = 0;
   setMedia();
-  playSeg(url, 'countdown', cdStart, runStart + interval * 1000 - LEAD * 1000, false);   // play() inside the tap unlocks audio
+  playFile(runUrl, 'run', 0, null);           // play() inside the tap unlocks audio on iOS
   loop();
 }
 
 function beginRun() {
-  if (state !== 'countdown') return;
   setState('running');
   hint.textContent = UI.tapToStop;
   lastText = ''; needsResume = false;
-  store.set('run', { state: 'running', start: runStart, interval });
-  render(Date.now() - runStart);
+  saveRun();
 }
+function saveRun() { store.set('run', { state: 'running', zero: audioZero, interval }); }
+setInterval(() => { if (state === 'running') saveRun(); }, 5000);
 
 function stop() {
   if (state === 'countdown') { reset(); return; }
   if (state !== 'running') return;
-  const elapsed = Date.now() - runStart;
+  const elapsed = Date.now() - runStart();
   cancelAnimationFrame(raf);
   setState('stopped');
   stoppedAt = performance.now();
   render(elapsed);
   hint.textContent = '';
   store.set('run', { state: 'stopped', elapsed });
-  const url = buildWav(4, [{ at: 0, ids: finalIds(Math.floor(elapsed / 1000)) }]);
-  playSeg(url, 'final', Date.now(), Date.now() + 4000, false);
+  const ids = finalIds(Math.floor(elapsed / 1000));
+  playFile(buildMp3(0.3, [{ at: SHIFT * FS, ids }]), 'final', 0, null);
 }
 
 function reset() {
   cancelAnimationFrame(raf);
   setState('idle');
-  segKind = null; player.pause(); clearMedia();
+  fileKind = null; player.pause(); clearMedia();
   lastText = ''; display.textContent = '00:00.00';
-  startBtn.disabled = !clipsReady;
+  startBtn.disabled = !pack;
   store.set('run', null);
 }
 
@@ -388,18 +366,25 @@ $('tapZone').addEventListener('pointerdown', e => {
   stop();
 });
 $('tapZone').addEventListener('click', () => {
-  if (!needsResume || !clipsReady) return;
+  if (!needsResume || !pack) return;
   needsResume = false; hint.textContent = UI.tapToStop;
   setMedia();
-  const start = Date.now(), end = nextBoundary(start + 50);
-  playSeg(runSegment(start, end), 'run', start, end, true);
+  resumeAudio();
 });
+function resumeAudio() {
+  const t = audioNow();
+  let from = 0;
+  if (t >= FILE_SEC + 3) from = 3 + FILE_SEC + Math.floor((t - 3 - FILE_SEC) / FILE_SEC) * FILE_SEC;
+  const url = from === 0 ? (runUrlFor === interval ? runUrl : (prebuild(), runUrl)) : buildRunFile(from);
+  playFile(url, 'run', from, t - from);
+  loop();
+}
 $('resetBtn').addEventListener('click', () => {
   if (performance.now() - stoppedAt < 600) return;   // ignore the click left over from the stop tap
   reset();
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && (state === 'running') && player.paused && !needsResume) onSegEnded();
+  if (document.visibilityState === 'visible' && state === 'running' && player.paused && !needsResume) player.play().catch(() => {});
 });
 document.addEventListener('contextmenu', e => e.preventDefault());
 document.addEventListener('gesturestart', e => e.preventDefault());
@@ -408,8 +393,8 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 (function restore() {
   const r = store.get('run', null);
   if (!r) return;
-  if (r.state === 'running') {
-    runStart = r.start;
+  if (r.state === 'running' && r.zero) {
+    audioZero = r.zero;
     if (INTERVALS.includes(r.interval)) interval = r.interval;
     setState('running');
     needsResume = true; hint.textContent = UI.tapToResume;
